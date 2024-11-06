@@ -1,0 +1,248 @@
+import os
+import gzip
+import pickle
+from collections import defaultdict
+from mpi4py import MPI
+import time
+class InMemoryIndex:
+    def __init__(self):
+        self.index = {}
+
+    def load_from_disk(self, index_path):
+        if os.path.exists(index_path):
+            with open(index_path, 'rb') as f:
+                self.index = pickle.load(f)
+
+    def save_to_disk(self, index_path):
+        with open(index_path, 'wb') as f:
+            pickle.dump(self.index, f)
+
+    def add(self, key, data):
+        self.index[key] = data
+
+    def get(self, key):
+        return self.index.get(key, None)
+
+    def remove(self, key):
+        if key in self.index:
+            del self.index[key]
+
+class DiskStorage:
+    def __init__(self, storage_path):
+        self.storage_path = storage_path
+        if not os.path.exists(storage_path):
+            os.makedirs(storage_path)
+
+    def _key_to_path(self, key):
+        if len(key) == 2:
+            graph_id, vertex_id = key
+            file_name = f"{graph_id.replace('/', '_')}_{vertex_id}"
+        elif len(key) == 3:
+            graph_id, vertex_id, edge_id = key
+            file_name = f"{graph_id.replace('/', '_')}_{vertex_id}_{edge_id}"
+        else:
+            raise ValueError("Invalid key format")
+        
+        return os.path.join(self.storage_path, file_name)
+
+    def add(self, key, data):
+        file_path = self._key_to_path(key)
+        print(f"Adding data to: {file_path}")  # Debug information
+        with open(file_path, 'wb') as f:
+            pickle.dump(data, f)
+
+    def get(self, key):
+        file_path = self._key_to_path(key)
+        print(f"Retrieving data from: {file_path}")  # Debug information
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                return pickle.load(f)
+        return None
+
+    def remove(self, key):
+        file_path = self._key_to_path(key)
+        print(f"Removing data from: {file_path}")  # Debug information
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+class VLMap:
+    def __init__(self):
+        self.map = {}
+
+    def add_vertex(self, vertex_id, disk_location):
+        self.map[vertex_id] = disk_location
+
+    def remove_vertex(self, vertex_id):
+        if vertex_id in self.map:
+            del self.map[vertex_id]
+
+    def location(self, vertex_id):
+        return self.map.get(vertex_id, None)
+
+    def related(self, graph_id):
+        return graph_id in self.map.values()
+
+    def is_only_related(self, graph_id):
+        return list(self.map.values()).count(graph_id) == 1
+
+    def related_graphs(self, query_graphs):
+        return {g for v, g in self.map.items() if g in query_graphs}
+
+class CompactGraphIndex:
+    def __init__(self):
+        self.index = defaultdict(set)
+
+    def update_index(self, vertex_id, graph_id, location):
+        self.index[vertex_id].add((graph_id, location))
+
+    def get_index(self, vertex_id):
+        return self.index.get(vertex_id, None)
+
+class GStarSystem:
+    def __init__(self, index_file, storage_path):
+        self.index_file = index_file
+        self.index = InMemoryIndex()
+        self.storage = DiskStorage(storage_path)
+        self.load_index()
+
+    def add_vertex(self, graph_id, vertex_id, vertex_data):
+        key = (graph_id, vertex_id)
+        existing_data = self.index.get(key)
+        if existing_data is None:
+            self.index.add(key, vertex_data)
+            self.storage.add(key, vertex_data)
+
+    def add_edge(self, graph_id, vertex_id, edge_id, edge_data):
+        vertex_key = (graph_id, vertex_id)
+        edge_key = (graph_id, vertex_id, edge_id)
+        
+        # Add the edge data
+        self.index.add(edge_key, edge_data)
+        self.storage.add(edge_key, edge_data)
+        
+        # Retrieve the current vertex data
+        vertex_data = self.storage.get(vertex_key)
+        if vertex_data is not None:
+            if 'edges' not in vertex_data:
+                vertex_data['edges'] = []
+            if edge_id not in vertex_data['edges']:
+                vertex_data['edges'].append(edge_id)
+            # Update the vertex data with the new edge
+            self.storage.add(vertex_key, vertex_data)
+        else:
+            # If vertex data does not exist, create it and add the edge
+            vertex_data = {'id': vertex_id, 'edges': [edge_id]}
+            self.index.add(vertex_key, vertex_data)
+            self.storage.add(vertex_key, vertex_data)
+
+    def get_vertex(self, graph_id, vertex_id):
+        key = (graph_id, vertex_id)
+        return self.storage.get(key)
+
+    def get_edge(self, graph_id, vertex_id, edge_id):
+        key = (graph_id, vertex_id, edge_id)
+        return self.storage.get(key)
+
+    def remove_vertex(self, graph_id, vertex_id):
+        key = (graph_id, vertex_id)
+        self.index.remove(key)
+        self.storage.remove(key)
+
+    def remove_edge(self, graph_id, vertex_id, edge_id):
+        key = (graph_id, vertex_id, edge_id)
+        self.index.remove(key)
+        self.storage.remove(key)
+
+    def save_index(self):
+        self.index.save_to_disk(self.index_file)
+
+    def load_index(self):
+        self.index.load_from_disk(self.index_file)
+
+    def get_vertex_with_neighbors(self, graph_id, vertex_id):
+        vertex_key = (graph_id, vertex_id)
+        vertex_data = self.storage.get(vertex_key)
+        if vertex_data is None:
+            return None
+        
+        neighbors = []
+        for edge_id in vertex_data.get('edges', []):
+            edge_key = (graph_id, vertex_id, edge_id)
+            edge_data = self.storage.get(edge_key)
+            neighbors.append((edge_id, edge_data))
+        
+        return vertex_id, vertex_data, neighbors
+
+def parse_twitter_dataset(twitter_dataset_path, rank, size, gstar_system):
+    with gzip.open(twitter_dataset_path, 'rt') as f:
+        for line_number, line in enumerate(f):
+            if line_number % size != rank:
+                continue
+
+            parts = line.strip().split()
+            if len(parts) != 2:
+                continue
+
+            vertex_id, edge_id = parts
+            graph_id = "/facebook"
+            vertex_data = {'id': vertex_id, 'edges': []}
+            edge_data = {'source': vertex_id, 'target': edge_id}
+
+            try:
+                print(f"Rank {rank} adding vertex {vertex_id}")  # Debug information
+                gstar_system.add_vertex(graph_id, vertex_id, vertex_data)
+            except ValueError as e:
+                print(e)
+
+            try:
+                print(f"Rank {rank} adding edge from {vertex_id} to {edge_id}")  # Debug information
+                gstar_system.add_edge(graph_id, vertex_id, edge_id, edge_data)
+            except ValueError as e:
+                print(e)
+
+def main():
+    start_time = time.time()
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    # Initialize GStarSystem on each process
+    storage_directory = os.path.join(os.getcwd(), f'storage_{rank}')
+    print(f"Storage directory for rank {rank}: {storage_directory}")  # Debug information
+    gstar_system = GStarSystem(f'index_{rank}.pkl', storage_directory)
+
+    facebook_dataset_path = r"C:\Users\areti\Downloads\facebook_combined (1).txt.gz"
+    # Parse and distribute the dataset
+    parse_twitter_dataset(facebook_dataset_path, rank, size, gstar_system)
+
+    # Example usage after loading data
+    if rank == 0:
+        graph_id = "/facebook"
+
+        # First query: List edges connected to vertex 1
+        vertex_id_1 = "1"
+        vertex_data_1 = gstar_system.get_vertex(graph_id, vertex_id_1)
+        if vertex_data_1:
+            edges_1 = vertex_data_1.get('edges', [])
+            print(f"Vertex {vertex_id_1} is connected to edges: {edges_1}")
+        else:
+            print(f"Vertex {vertex_id_1} not found")
+
+        # Second query: List neighbors of vertex 2
+        vertex_id_2 = "2"
+        vertex_data_2 = gstar_system.get_vertex(graph_id, vertex_id_2)
+        if vertex_data_2:
+            neighbors_2 = []
+            for edge_id in vertex_data_2.get('edges', []):
+                edge_data = gstar_system.get_edge(graph_id, vertex_id_2, edge_id)
+                if edge_data:
+                    neighbors_2.append(edge_data['target'])
+            print(f"Vertex {vertex_id_2} has neighbors: {neighbors_2}")
+        else:
+            print(f"Vertex {vertex_id_2} not found")
+    end_time = time.time()  # End time
+    elapsed_time = end_time - start_time
+    print(f"Process completed in {elapsed_time} seconds")
+
+if __name__ == "__main__":
+    main()
